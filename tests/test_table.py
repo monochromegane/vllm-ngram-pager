@@ -113,3 +113,13 @@ def test_lookup_returns_fp8_rows_on_the_ids_device(files):
     assert out.dtype == torch.float8_e4m3fn
     assert out.device == ids.device
     assert np.array_equal(out.view(torch.uint8).numpy(), rows(0, 13)[ids.numpy()])
+
+
+def test_lookup_writes_into_the_given_buffer(files):
+    # The eager section of a CUDA graph writes into the caller's fixed buffer
+    # (embedding._ple_lookup).
+    table = NGramTable(find_shards(files, NAME))
+    ids = torch.tensor([[12, 0], [5, 4]], dtype=torch.int64)
+    out = torch.empty((2, 2, COLS), dtype=torch.float8_e4m3fn)
+    assert table.lookup(ids, torch.float8_e4m3fn, out=out) is out
+    assert np.array_equal(out.view(torch.uint8).numpy(), rows(0, 13)[ids.numpy()])

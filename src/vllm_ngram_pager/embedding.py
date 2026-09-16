@@ -5,13 +5,18 @@
 - Loading: ``weight_loader`` only validates the shape of each shard and reads no data
 - After loading: find the safetensors of the checkpoint and open the table (table.py)
 - Inference: ``forward`` copies the ngram ids to the host, gathers the rows from the
-  table, and moves them back to the device (eager only)
+  table, and moves them back to the device. Under breakable CUDA graphs (PIECEWISE)
+  this runs on every step in an eager section where the capture is broken
 """
 
 import glob
 import os
 
 import torch
+from vllm.compilation.breakable_cudagraph import (
+    BreakableCUDAGraphCapture,
+    eager_break_during_capture,
+)
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import download_weights_from_hf
@@ -66,6 +71,12 @@ class PagedPLEEmbedding(PLEVocabParallelEmbedding):
         # files when the table is opened.
         self._ple_seen: dict[int, tuple[int, ...]] = {}
         self._ple_table: NGramTable | None = None
+        # Fixed output buffer per captured shape (_ple_lookup).
+        self._ple_out: dict[tuple[int, ...], torch.Tensor] = {}
+        # The decorator reads the env (VLLM_USE_BREAKABLE_CUDAGRAPH) when it is applied,
+        # so apply it here at construction time, once the config is final. Import time
+        # would be earlier than the automatic enablement in config/vllm.py.
+        self._ple_lookup = eager_break_during_capture(self._ple_lookup)
 
     # ---- loading ----
 
@@ -119,13 +130,42 @@ class PagedPLEEmbedding(PLEVocabParallelEmbedding):
     # ---- forward ----
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
+        assert self._ple_table is not None
+        if not torch.cuda.is_current_stream_capturing():
+            return self._ple_table.lookup(input_, self.weight.dtype)
+        # Capturing a breakable CUDA graph. _ple_lookup runs in an eager section where
+        # the capture is broken (and runs in Python on every replay as well), writing
+        # into a fixed buffer per shape. The following graph section bakes in that
+        # address.
+        return self._ple_lookup(input_)
+
+    def _ple_lookup(self, ids: torch.Tensor) -> torch.Tensor:
         if torch.cuda.is_current_stream_capturing():
+            # eager_break_during_capture did not break the capture (FULL mode, or a
+            # capture that is not breakable).
             raise RuntimeError(
                 "vllm-ngram-pager: the n-gram lookup reads ids on the host and cannot be "
-                "captured into a CUDA graph; run with --enforce-eager"
+                "captured into a CUDA graph; use breakable CUDA graphs with "
+                '--compilation-config \'{"cudagraph_mode": "PIECEWISE"}\', '
+                "or --enforce-eager"
             )
         assert self._ple_table is not None
-        return self._ple_table.lookup(input_, self.weight.dtype)
+        out = self._ple_out.get(tuple(ids.shape))
+        if out is None:
+            # Allocated outside the capture, so it is not in the graph pool and stays
+            # alive across replays.
+            out = torch.empty(
+                (*ids.shape, self.embedding_dim),
+                dtype=self.weight.dtype,
+                device=ids.device,
+            )
+            self._ple_out[tuple(ids.shape)] = out
+        # In the call made during the capture the preceding graph section has not run,
+        # so the contents of ids are undefined; do not read them. On replay the
+        # preceding section writes ids before this function runs on the same stream.
+        if BreakableCUDAGraphCapture.is_active():
+            return out
+        return self._ple_table.lookup(ids, self.weight.dtype, out=out)
 
 
 def _checkpoint_files(

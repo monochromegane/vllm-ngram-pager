@@ -117,11 +117,17 @@ class NGramTable:
             out[m] = self.maps[k][local[m]]
         return out.reshape(*ids.shape, self.cols)
 
-    def lookup(self, ids: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    def lookup(
+        self, ids: torch.Tensor, dtype: torch.dtype, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Return the rows of ``ids`` as ``dtype`` of shape ``(*ids.shape, cols)``.
 
-        The result is on the device of ``ids``. Copying ``ids`` to the host
-        synchronizes with the device.
+        The result is on the device of ``ids``. When ``out`` is given, write into it
+        and return it (the eager section of a CUDA graph must write into a fixed
+        buffer). Copying ``ids`` to the host synchronizes with the device.
         """
-        rows = self.gather(ids.cpu().numpy())
-        return torch.from_numpy(rows).to(ids.device).view(dtype)
+        rows = torch.from_numpy(self.gather(ids.cpu().numpy()))
+        if out is None:
+            return rows.to(ids.device).view(dtype)
+        out.view(torch.uint8).copy_(rows)
+        return out
