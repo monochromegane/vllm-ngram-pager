@@ -1,0 +1,26 @@
+[project]
+name = "vllm-ngram-pager"
+version = "0.1.0"
+description = "vLLM plugin that pages the Qwen4Exp n-gram embedding table from host RAM and SSD"
+readme = "README.md"
+authors = [
+    { name = "monochromegane" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.26,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.4",
+    "torch>=2.13.0",
+]
+
+[project.entry-points."vllm.general_plugins"]
+ngram_pager = "vllm_ngram_pager.plugin:register"
