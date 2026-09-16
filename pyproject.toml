@@ -3,6 +3,7 @@ name = "vllm-ngram-pager"
 version = "0.1.0"
 description = "vLLM plugin that pages the Qwen4Exp n-gram embedding table from host RAM and SSD"
 readme = "README.md"
+license = "MIT"
 authors = [
     { name = "monochromegane" }
 ]
