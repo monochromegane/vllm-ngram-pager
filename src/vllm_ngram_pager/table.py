@@ -151,8 +151,14 @@ class NGramTable:
         The result is on the device of ``ids``. When ``out`` is given, write into it
         and return it (the eager section of a CUDA graph must write into a fixed
         buffer). Copying ``ids`` to the host synchronizes with the device.
+
+        The three stages (device sync, table read, copy back to the device) are kept
+        on separate lines so that a thread dump of a stuck process shows which stage
+        is waiting. ``.cpu()`` releases the GIL while it waits for the GPU, whereas
+        ``gather`` reads the table holding the GIL, so the two stall differently.
         """
-        rows = torch.from_numpy(self.gather(ids.cpu().numpy()))
+        host_ids = ids.cpu().numpy()  # device sync (releases the GIL)
+        rows = torch.from_numpy(self.gather(host_ids))  # table read (holds the GIL)
         if out is None:
             return rows.to(ids.device).view(dtype)
         out.view(torch.uint8).copy_(rows)
