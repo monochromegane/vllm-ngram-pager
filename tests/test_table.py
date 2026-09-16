@@ -1,6 +1,7 @@
 """Tests for table.py: write small safetensors files, then find shards and gather rows."""
 
 import json
+import mmap
 import struct
 
 import numpy as np
@@ -123,3 +124,29 @@ def test_lookup_writes_into_the_given_buffer(files):
     out = torch.empty((2, 2, COLS), dtype=torch.float8_e4m3fn)
     assert table.lookup(ids, torch.float8_e4m3fn, out=out) is out
     assert np.array_equal(out.view(torch.uint8).numpy(), rows(0, 13)[ids.numpy()])
+
+
+def test_gather_advises_page_aligned_ranges_covering_each_row(files):
+    # Each MADV_WILLNEED range must start on a page boundary and cover every byte of
+    # the row. np.memmap rounds the offset down to a page boundary, so the array starts
+    # partway into the mmap.
+    shards = find_shards(files, NAME)
+    table = NGramTable(shards)
+    calls: list[list[tuple[int, int, int]]] = [[] for _ in shards]
+    for k, m in enumerate(table.maps):
+        m._mmap = type(
+            "Recorder", (), {"madvise": lambda self, *a, _k=k: calls[_k].append(a)}
+        )()
+    ids = np.array([12, 0, 5, 4, 9])
+    assert np.array_equal(table.gather(ids), rows(0, 13)[ids])
+    for k, s in enumerate(shards):
+        mmap_start = s.offset - s.offset % mmap.ALLOCATIONGRANULARITY
+        expected_rows = [
+            r - k * table.shard_rows for r in ids if r // table.shard_rows == k
+        ]
+        assert len(calls[k]) == len(expected_rows)
+        for (option, start, length), r in zip(calls[k], expected_rows):
+            row_start = s.offset - mmap_start + r * COLS
+            assert option == mmap.MADV_WILLNEED
+            assert start % mmap.PAGESIZE == 0
+            assert start <= row_start and row_start + COLS <= start + length

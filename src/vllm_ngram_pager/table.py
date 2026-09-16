@@ -8,9 +8,14 @@ The safetensors shards of the checkpoint (128 of them, each (2,500,012, 160) fp8
 as the table as they are, and rows are read through ``np.memmap``. No separate paging
 file is written. The RAM tier is left to the OS page cache; the plugin keeps none of
 its own.
+
+The rows are scattered at random, so the mmaps get ``MADV_RANDOM`` to stop the
+per-fault readahead, and before gathering, a per-row ``MADV_WILLNEED`` hands all the
+reads to the kernel at once (the faults then proceed in parallel).
 """
 
 import json
+import mmap
 import re
 import struct
 from collections.abc import Iterable
@@ -100,6 +105,10 @@ class NGramTable:
             )
             for s in shards
         ]
+        for m in self.maps:
+            # Stop readahead (read_ahead_kb per fault, which can be several MiB). The
+            # neighbouring pages are never used.
+            m._mmap.madvise(mmap.MADV_RANDOM)
 
     def gather(self, ids: np.ndarray) -> np.ndarray:
         """Return the rows numbered ``ids`` (any shape) as ``(*ids.shape, cols)`` uint8."""
@@ -112,10 +121,27 @@ class NGramTable:
         out = np.empty((flat.size, self.cols), dtype=np.uint8)
         shard = flat // self.shard_rows
         local = flat - shard * self.shard_rows
-        for k in np.unique(shard):
-            m = shard == k
+        groups = [(k, shard == k) for k in np.unique(shard)]
+        # Issue the reads for every shard first, then gather. Issuing and gathering
+        # shard by shard would serialize the waits on the faults.
+        for k, m in groups:
+            self._willneed(k, local[m])
+        for k, m in groups:
             out[m] = self.maps[k][local[m]]
         return out.reshape(*ids.shape, self.cols)
+
+    def _willneed(self, k: int, rows: np.ndarray) -> None:
+        """Ask the kernel to read the pages holding rows ``rows`` of shard ``k``.
+
+        Asynchronous; does not wait for the reads.
+        """
+        m = self.maps[k]
+        # np.memmap rounds the offset down to a page boundary for the mmap; the array is
+        # a view partway into it.
+        base = m.offset % mmap.ALLOCATIONGRANULARITY
+        for start in (base + rows * self.cols).tolist():
+            page = start - start % mmap.PAGESIZE
+            m._mmap.madvise(mmap.MADV_WILLNEED, page, start + self.cols - page)
 
     def lookup(
         self, ids: torch.Tensor, dtype: torch.dtype, out: torch.Tensor | None = None
